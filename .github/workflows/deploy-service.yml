@@ -1,0 +1,93 @@
+name: Deploy service (reusable)
+
+# Standalone deploy-only counterpart to publish-images.yml's opt-in `deploy` job, for
+# callers that can't use publish-images.yml's build job directly (e.g.
+# platform-digital-plan's publish-auth.yml/publish-core.yml, which need a two-repo
+# checkout that doesn't fit a single `actions/checkout@v4` call) but still want the same
+# Cloudflare-resolved SSH deploy behavior after their own build+push job succeeds.
+#
+# Resolves the VPS's CURRENT IP from Cloudflare's DNS A-record for `hostname` (via the
+# Cloudflare API, not a plain DNS lookup — these hostnames are Cloudflare-proxied, so a
+# normal resolution would return Cloudflare's edge IP, not the VPS's real IP), then SSHes
+# in to run `docker compose pull/up -d` for `compose-service`.
+#
+# Caller usage:
+#   jobs:
+#     build:
+#       ...
+#     deploy:
+#       needs: build
+#       uses: trung-nguyen-thiso/thiso-actions/.github/workflows/deploy-service.yml@main
+#       with:
+#         hostname: thiso-auth.williamthanhtrung.id.vn
+#         compose-service: auth
+#       secrets:
+#         cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+#         vps-ssh-key: ${{ secrets.VPS_SSH_KEY }}
+
+on:
+  workflow_call:
+    inputs:
+      hostname:
+        description: "Public hostname whose Cloudflare A-record currently points at the target VPS"
+        required: true
+        type: string
+      compose-service:
+        description: "docker-compose service name to `pull` + `up -d` on the VPS"
+        required: true
+        type: string
+      repo-path:
+        description: "Path on the VPS to the docker-compose project directory"
+        required: false
+        type: string
+        default: "~/repo/platform-digital-plan"
+      ssh-user:
+        description: "SSH user on the VPS"
+        required: false
+        type: string
+        default: "tuf"
+    secrets:
+      cloudflare-api-token:
+        required: true
+      vps-ssh-key:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve VPS IP via Cloudflare
+        id: resolve
+        env:
+          CF_TOKEN: ${{ secrets.cloudflare-api-token }}
+          HOSTNAME: ${{ inputs.hostname }}
+        run: |
+          zone_name=$(echo "$HOSTNAME" | cut -d. -f2-)
+          zone_id=$(curl -sf -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/zones?name=${zone_name}" | jq -r '.result[0].id // empty')
+          if [ -z "$zone_id" ]; then
+            echo "::error::Could not resolve Cloudflare zone id for $zone_name"
+            exit 1
+          fi
+          ip=$(curl -sf -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?type=A&name=${HOSTNAME}" | jq -r '.result[0].content // empty')
+          if [ -z "$ip" ]; then
+            echo "::error::Could not resolve an A record for $HOSTNAME"
+            exit 1
+          fi
+          echo "ip=$ip" >> "$GITHUB_OUTPUT"
+
+      - name: SSH deploy ${{ inputs.compose-service }}
+        env:
+          SSH_KEY: ${{ secrets.vps-ssh-key }}
+          TARGET_IP: ${{ steps.resolve.outputs.ip }}
+          SSH_USER: ${{ inputs.ssh-user }}
+          REPO_PATH: ${{ inputs.repo-path }}
+          COMPOSE_SERVICE: ${{ inputs.compose-service }}
+        run: |
+          install -m 600 /dev/null id_deploy
+          printf '%s\n' "$SSH_KEY" > id_deploy
+          ssh -i id_deploy -o StrictHostKeyChecking=accept-new -o BatchMode=yes -p 22 \
+            "${SSH_USER}@${TARGET_IP}" \
+            "cd ${REPO_PATH} && docker compose pull ${COMPOSE_SERVICE} && docker compose up -d ${COMPOSE_SERVICE}"
+          rm -f id_deploy

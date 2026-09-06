@@ -192,52 +192,15 @@ jobs:
   deploy:
     needs: [probe, build]
     if: inputs.deploy == true
-    runs-on: ubuntu-latest
-    steps:
-      # Resolve the VPS's CURRENT IP from Cloudflare's own DNS record for deploy-hostname,
-      # rather than a plain `dig`/`nslookup` — these hostnames are Cloudflare-proxied, so a
-      # normal DNS resolution returns Cloudflare's edge IP, not the VPS. The Cloudflare API
-      # returns the real configured origin IP regardless of proxy status.
-      - name: Resolve VPS IP via Cloudflare
-        id: resolve
-        env:
-          CF_TOKEN: ${{ secrets.cloudflare-api-token }}
-          HOSTNAME: ${{ inputs.deploy-hostname }}
-        run: |
-          if [ -z "$HOSTNAME" ]; then
-            echo "::error::deploy-hostname is required when deploy: true"
-            exit 1
-          fi
-          zone_name=$(echo "$HOSTNAME" | cut -d. -f2-)
-          zone_id=$(curl -sf -H "Authorization: Bearer $CF_TOKEN" \
-            "https://api.cloudflare.com/client/v4/zones?name=${zone_name}" | jq -r '.result[0].id // empty')
-          if [ -z "$zone_id" ]; then
-            echo "::error::Could not resolve Cloudflare zone id for $zone_name"
-            exit 1
-          fi
-          ip=$(curl -sf -H "Authorization: Bearer $CF_TOKEN" \
-            "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?type=A&name=${HOSTNAME}" | jq -r '.result[0].content // empty')
-          if [ -z "$ip" ]; then
-            echo "::error::Could not resolve an A record for $HOSTNAME"
-            exit 1
-          fi
-          echo "ip=$ip" >> "$GITHUB_OUTPUT"
-
-      - name: SSH deploy ${{ inputs.deploy-compose-service }}
-        env:
-          SSH_KEY: ${{ secrets.vps-ssh-key }}
-          TARGET_IP: ${{ steps.resolve.outputs.ip }}
-          SSH_USER: ${{ inputs.deploy-ssh-user }}
-          REPO_PATH: ${{ inputs.deploy-repo-path }}
-          COMPOSE_SERVICE: ${{ inputs.deploy-compose-service }}
-        run: |
-          if [ -z "$COMPOSE_SERVICE" ]; then
-            echo "::error::deploy-compose-service is required when deploy: true"
-            exit 1
-          fi
-          install -m 600 /dev/null id_deploy
-          printf '%s\n' "$SSH_KEY" > id_deploy
-          ssh -i id_deploy -o StrictHostKeyChecking=accept-new -o BatchMode=yes -p 22 \
-            "${SSH_USER}@${TARGET_IP}" \
-            "cd ${REPO_PATH} && docker compose pull ${COMPOSE_SERVICE} && docker compose up -d ${COMPOSE_SERVICE}"
-          rm -f id_deploy
+    # Delegates to deploy-service.yml so the Cloudflare-resolve + SSH logic lives in exactly
+    # one place, shared with platform-digital-plan's publish-auth.yml/publish-core.yml (which
+    # can't call this build job directly — they need a two-repo checkout).
+    uses: ./.github/workflows/deploy-service.yml
+    with:
+      hostname: ${{ inputs.deploy-hostname }}
+      compose-service: ${{ inputs.deploy-compose-service }}
+      repo-path: ${{ inputs.deploy-repo-path }}
+      ssh-user: ${{ inputs.deploy-ssh-user }}
+    secrets:
+      cloudflare-api-token: ${{ secrets.cloudflare-api-token }}
+      vps-ssh-key: ${{ secrets.vps-ssh-key }}
