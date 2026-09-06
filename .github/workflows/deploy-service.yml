@@ -112,7 +112,13 @@ jobs:
           version="$3"
           cd "$repo_path"
           env_var="$(echo "$compose_service" | tr '[:lower:]' '[:upper:]')_IMAGE_TAG"
-          env_file=".env"
+          # .env here is typically a symlink into ~/dev/shared/.../secrets/app/.env. Resolve
+          # to the real path FIRST and operate on that directly — `sed -i` on a symlink
+          # writes a temp file and renames it over the symlink's own path, which UNLINKS the
+          # symlink and leaves a plain file behind (discovered 2026-09-06: this silently
+          # forked the repo's .env from the real secrets file). Resolving with `readlink -f`
+          # also means the backup lands next to the real secrets file, not the repo checkout.
+          env_file="$(readlink -f .env)"
           ts="$(date +%Y%m%d-%H%M%S)"
           cp "$env_file" "${env_file}.bak.${ts}"
           if grep -q "^${env_var}=" "$env_file"; then
