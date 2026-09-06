@@ -36,6 +36,26 @@ name: Publish images (reusable)
 # "build-args" (optional) is a newline-separated KEY=VALUE list passed straight through to
 # docker/build-push-action, e.g. for a frontend image that inlines a public API base URL at
 # build time.
+#
+# Optional deploy job (2026-09-06, opt-in): set `deploy: true` to SSH-deploy the built
+# service on the VPS immediately after build+push succeeds. The deploy target IP is NOT a
+# hardcoded secret — it's resolved at deploy time from Cloudflare's DNS A-record for
+# `deploy-hostname`, via the Cloudflare API (not a plain DNS lookup, since these hostnames
+# are Cloudflare-proxied and a normal DNS resolution would return Cloudflare's edge IP, not
+# the VPS's real IP). This means the VPS's IP can change without any workflow needing a
+# manual secret update — only Cloudflare's DNS record needs to stay current.
+#
+# Callers that don't pass `deploy: true` (e.g. multi-tenant-sync) are completely unaffected
+# — the deploy job is skipped and none of the deploy-* inputs/secrets are required.
+#
+# Deploy caller usage (added to the `with:` block above):
+#   deploy: true
+#   deploy-hostname: thiso-web.williamthanhtrung.id.vn   # whichever public hostname shares the VPS
+#   deploy-compose-service: web                          # docker-compose service name to pull+recreate
+#   deploy-repo-path: ~/repo/platform-digital-plan        # optional, this is the default
+# and in `secrets:`:
+#   cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+#   vps-ssh-key: ${{ secrets.VPS_SSH_KEY }}
 
 on:
   workflow_call:
@@ -67,11 +87,42 @@ on:
         required: false
         type: string
         default: ""
+      deploy:
+        description: "Opt-in: SSH-deploy deploy-compose-service on the VPS after build+push, target IP resolved via Cloudflare"
+        required: false
+        type: boolean
+        default: false
+      deploy-hostname:
+        description: "Public hostname whose Cloudflare A-record currently points at the target VPS (e.g. thiso-web.williamthanhtrung.id.vn) — required when deploy is true"
+        required: false
+        type: string
+        default: ""
+      deploy-compose-service:
+        description: "docker-compose service name to `pull` + `up -d` on the VPS (e.g. web, auth, core, policy) — required when deploy is true"
+        required: false
+        type: string
+        default: ""
+      deploy-repo-path:
+        description: "Path on the VPS to the docker-compose project directory"
+        required: false
+        type: string
+        default: "~/repo/platform-digital-plan"
+      deploy-ssh-user:
+        description: "SSH user on the VPS"
+        required: false
+        type: string
+        default: "tuf"
     secrets:
       registry-username:
         required: true
       registry-password:
         required: true
+      cloudflare-api-token:
+        description: "Required when deploy is true"
+        required: false
+      vps-ssh-key:
+        description: "Private half of a keypair whose public half is in the VPS's ~/.ssh/authorized_keys. Required when deploy is true"
+        required: false
 
 jobs:
   probe:
@@ -137,3 +188,56 @@ jobs:
           tags: |
             ${{ inputs.registry }}/${{ inputs.namespace }}/${{ matrix.image.name }}:${{ needs.probe.outputs.version }}
             ${{ inputs.registry }}/${{ inputs.namespace }}/${{ matrix.image.name }}:latest
+
+  deploy:
+    needs: [probe, build]
+    if: inputs.deploy == true
+    runs-on: ubuntu-latest
+    steps:
+      # Resolve the VPS's CURRENT IP from Cloudflare's own DNS record for deploy-hostname,
+      # rather than a plain `dig`/`nslookup` — these hostnames are Cloudflare-proxied, so a
+      # normal DNS resolution returns Cloudflare's edge IP, not the VPS. The Cloudflare API
+      # returns the real configured origin IP regardless of proxy status.
+      - name: Resolve VPS IP via Cloudflare
+        id: resolve
+        env:
+          CF_TOKEN: ${{ secrets.cloudflare-api-token }}
+          HOSTNAME: ${{ inputs.deploy-hostname }}
+        run: |
+          if [ -z "$HOSTNAME" ]; then
+            echo "::error::deploy-hostname is required when deploy: true"
+            exit 1
+          fi
+          zone_name=$(echo "$HOSTNAME" | cut -d. -f2-)
+          zone_id=$(curl -sf -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/zones?name=${zone_name}" | jq -r '.result[0].id // empty')
+          if [ -z "$zone_id" ]; then
+            echo "::error::Could not resolve Cloudflare zone id for $zone_name"
+            exit 1
+          fi
+          ip=$(curl -sf -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?type=A&name=${HOSTNAME}" | jq -r '.result[0].content // empty')
+          if [ -z "$ip" ]; then
+            echo "::error::Could not resolve an A record for $HOSTNAME"
+            exit 1
+          fi
+          echo "ip=$ip" >> "$GITHUB_OUTPUT"
+
+      - name: SSH deploy ${{ inputs.deploy-compose-service }}
+        env:
+          SSH_KEY: ${{ secrets.vps-ssh-key }}
+          TARGET_IP: ${{ steps.resolve.outputs.ip }}
+          SSH_USER: ${{ inputs.deploy-ssh-user }}
+          REPO_PATH: ${{ inputs.deploy-repo-path }}
+          COMPOSE_SERVICE: ${{ inputs.deploy-compose-service }}
+        run: |
+          if [ -z "$COMPOSE_SERVICE" ]; then
+            echo "::error::deploy-compose-service is required when deploy: true"
+            exit 1
+          fi
+          install -m 600 /dev/null id_deploy
+          printf '%s\n' "$SSH_KEY" > id_deploy
+          ssh -i id_deploy -o StrictHostKeyChecking=accept-new -o BatchMode=yes -p 22 \
+            "${SSH_USER}@${TARGET_IP}" \
+            "cd ${REPO_PATH} && docker compose pull ${COMPOSE_SERVICE} && docker compose up -d ${COMPOSE_SERVICE}"
+          rm -f id_deploy
