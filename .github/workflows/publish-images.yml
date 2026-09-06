@@ -48,6 +48,11 @@ name: Publish images (reusable)
 # Callers that don't pass `deploy: true` (e.g. multi-tenant-sync) are completely unaffected
 # — the deploy job is skipped and none of the deploy-* inputs/secrets are required.
 #
+# 2026-09-06 bug fix: this job now passes needs.probe.outputs.version through to
+# deploy-service.yml, which pins it into the VPS's .env before pulling — previously the
+# deploy job only ran `docker compose pull/up -d`, which silently re-pulled whatever tag
+# was already pinned (a no-op deploy that still reported success). See deploy-service.yml.
+#
 # Deploy caller usage (added to the `with:` block above):
 #   deploy: true
 #   deploy-hostname: thiso-web.williamthanhtrung.id.vn   # whichever public hostname shares the VPS
@@ -199,6 +204,7 @@ jobs:
     with:
       hostname: ${{ inputs.deploy-hostname }}
       compose-service: ${{ inputs.deploy-compose-service }}
+      version: ${{ needs.probe.outputs.version }}
       repo-path: ${{ inputs.deploy-repo-path }}
       ssh-user: ${{ inputs.deploy-ssh-user }}
     secrets:

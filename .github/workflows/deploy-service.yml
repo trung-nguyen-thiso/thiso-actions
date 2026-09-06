@@ -9,18 +9,29 @@ name: Deploy service (reusable)
 # Resolves the VPS's CURRENT IP from Cloudflare's DNS A-record for `hostname` (via the
 # Cloudflare API, not a plain DNS lookup — these hostnames are Cloudflare-proxied, so a
 # normal resolution would return Cloudflare's edge IP, not the VPS's real IP), then SSHes
-# in to run `docker compose pull/up -d` for `compose-service`.
+# in to pin the just-built version into the VPS's `.env` and run `docker compose pull/up -d`
+# for `compose-service`.
+#
+# 2026-09-06 bug fix: the compose file pins each service's image by a per-service env var
+# read from the VPS's `.env` (e.g. `image: .../thiso-web:${WEB_IMAGE_TAG:-1.0.0}`). Before
+# this fix, this job only ran `docker compose pull && up -d` — it never updated that env
+# var, so every deploy after the first re-pulled whatever tag `.env` already pinned (a
+# no-op that still reported success). `version` is now REQUIRED, and is written into
+# `<COMPOSE_SERVICE upper-cased>_IMAGE_TAG` in `.env` before the pull, with a timestamped
+# backup taken first (this file also holds JWT keys/DB passwords — never edit it without a
+# backup) and the resulting line verified with grep before touching the container.
 #
 # Caller usage:
 #   jobs:
 #     build:
 #       ...
 #     deploy:
-#       needs: build
+#       needs: [probe, build]   # both — probe holds the version output
 #       uses: trung-nguyen-thiso/thiso-actions/.github/workflows/deploy-service.yml@main
 #       with:
 #         hostname: thiso-auth.williamthanhtrung.id.vn
 #         compose-service: auth
+#         version: ${{ needs.probe.outputs.version }}
 #       secrets:
 #         cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
 #         vps-ssh-key: ${{ secrets.VPS_SSH_KEY }}
@@ -34,6 +45,10 @@ on:
         type: string
       compose-service:
         description: "docker-compose service name to `pull` + `up -d` on the VPS"
+        required: true
+        type: string
+      version:
+        description: "Version just built and pushed (e.g. 1.0.4) — written into <COMPOSE_SERVICE>_IMAGE_TAG in the VPS's .env before pulling"
         required: true
         type: string
       repo-path:
@@ -84,10 +99,32 @@ jobs:
           SSH_USER: ${{ inputs.ssh-user }}
           REPO_PATH: ${{ inputs.repo-path }}
           COMPOSE_SERVICE: ${{ inputs.compose-service }}
+          VERSION: ${{ inputs.version }}
         run: |
           install -m 600 /dev/null id_deploy
           printf '%s\n' "$SSH_KEY" > id_deploy
           ssh -i id_deploy -o StrictHostKeyChecking=accept-new -o BatchMode=yes -p 22 \
             "${SSH_USER}@${TARGET_IP}" \
-            "cd ${REPO_PATH} && docker compose pull ${COMPOSE_SERVICE} && docker compose up -d ${COMPOSE_SERVICE}"
+            bash -s -- "$REPO_PATH" "$COMPOSE_SERVICE" "$VERSION" <<'REMOTE'
+          set -euo pipefail
+          repo_path="$1"
+          compose_service="$2"
+          version="$3"
+          cd "$repo_path"
+          env_var="$(echo "$compose_service" | tr '[:lower:]' '[:upper:]')_IMAGE_TAG"
+          env_file=".env"
+          ts="$(date +%Y%m%d-%H%M%S)"
+          cp "$env_file" "${env_file}.bak.${ts}"
+          if grep -q "^${env_var}=" "$env_file"; then
+            sed -i "s/^${env_var}=.*/${env_var}=${version}/" "$env_file"
+          else
+            echo "${env_var}=${version}" >> "$env_file"
+          fi
+          if ! grep -qx "${env_var}=${version}" "$env_file"; then
+            echo "Failed to pin ${env_var}=${version} in ${env_file} — aborting before touching the container" >&2
+            exit 1
+          fi
+          docker compose pull "$compose_service"
+          docker compose up -d "$compose_service"
+          REMOTE
           rm -f id_deploy
