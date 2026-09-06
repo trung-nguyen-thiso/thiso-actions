@@ -27,6 +27,15 @@ name: Publish images (reusable)
 #
 # "images" is a JSON array of {target, name} — target is the Dockerfile build stage, name is
 # the image repo name under registry/namespace. One entry per image the repo builds; any count.
+#
+# The version tag is derived from GITHUB_REF_NAME by taking everything after the LAST "v"
+# immediately preceding a semver: "v1.4.0" -> "1.4.0", and "web-v1.0.0" (a per-image tag
+# prefix, e.g. platform-digital-plan tagging four images independently as auth-vX.Y.Z /
+# core-vX.Y.Z / web-vX.Y.Z / policy-vX.Y.Z out of one repo) -> "1.0.0".
+#
+# "build-args" (optional) is a newline-separated KEY=VALUE list passed straight through to
+# docker/build-push-action, e.g. for a frontend image that inlines a public API base URL at
+# build time.
 
 on:
   workflow_call:
@@ -53,6 +62,11 @@ on:
         required: false
         type: string
         default: "."
+      build-args:
+        description: "Newline-separated KEY=VALUE build args, passed through to docker/build-push-action"
+        required: false
+        type: string
+        default: ""
     secrets:
       registry-username:
         required: true
@@ -65,9 +79,20 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.value }}
     steps:
+      # Strips everything up through the last "v" before the semver, so both a bare
+      # "v1.4.0" (multi-tenant-sync's scheme) and a per-service-prefixed "web-v1.0.0"
+      # (platform-digital-plan's scheme, one tag prefix per image in a shared repo)
+      # resolve to the same "1.4.0" / "1.0.0" — plain `${GITHUB_REF_NAME#v}` only
+      # strips a LEADING "v", which does nothing for "web-v1.0.0".
       - name: Derive version from tag
         id: version
-        run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: |
+          version=$(echo "$GITHUB_REF_NAME" | grep -oP 'v\K[0-9]+\.[0-9]+\.[0-9]+$')
+          if [ -z "$version" ]; then
+            echo "::error::Could not extract a vX.Y.Z version from tag '$GITHUB_REF_NAME'"
+            exit 1
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
 
       - uses: docker/login-action@v3
         with:
@@ -107,6 +132,7 @@ jobs:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
           target: ${{ matrix.image.target }}
+          build-args: ${{ inputs.build-args }}
           push: true
           tags: |
             ${{ inputs.registry }}/${{ inputs.namespace }}/${{ matrix.image.name }}:${{ needs.probe.outputs.version }}
